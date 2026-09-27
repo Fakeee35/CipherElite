@@ -10,6 +10,7 @@
 # =============================================================================
 
 import json
+import re
 from pathlib import Path
 from telethon import events, Button
 import html
@@ -91,6 +92,265 @@ def get_bot_plugins_count():
         f for f in bot_plugins_path.glob("*.py")
         if f.stem != "__init__"
     ])
+
+
+# =============================================================================
+#  AUTO-DISCOVERED HELP CATEGORIES
+#  Any bot plugin whose handlers are registered on the bot client gets its
+#  slash commands listed under its own category in the /help menu — no manual
+#  editing needed when new plugins are added.
+# =============================================================================
+
+# Modules whose commands are described manually in _CORE_CATEGORIES below,
+# plus shared/helper modules that register nothing user-facing.
+_SKIP_DISCOVERY = {
+    "assistant", "alive_customize", "whisper_bot", "_shared", "__init__",
+}
+
+# Nice icons/titles for known plugin modules; anything else gets the fallback.
+_DISCOVERED_META = {
+    "moderation": ("⚖️", "Moderation"),
+    "chatguard": ("🛡", "Chat Guard"),
+    "joinmod": ("👋", "Join Moderation"),
+    "tools": ("🧮", "Tools"),
+    "adult_mode": ("🔞", "Adult Mode"),
+}
+
+_CORE_CATEGORIES = {
+    "assistant": {
+        "icon": "🤖",
+        "title": "Assistant Commands",
+        "commands": [
+            ("/start", "Show main menu"),
+            ("/help", "Show help menu"),
+            ("/assistant", "Assistant status"),
+            ("/assistant on", "Enable assistant mode"),
+            ("/assistant off", "Disable assistant mode"),
+            ("/assistant status", "Check assistant status"),
+        ]
+    },
+    "alive": {
+        "icon": "⚡",
+        "title": "Alive / Ping Commands",
+        "commands": [
+            ("/alive", "Customize alive message"),
+            ("/ping", "Customize ping message"),
+            ("Buttons", "Change style, pic, quotes"),
+        ]
+    },
+    "whisper": {
+        "icon": "🤫",
+        "title": "Whisper Commands",
+        "commands": [
+            (".w @username <text>", "Send secret whisper to user"),
+            (".w <text> (reply)", "Send whisper by replying"),
+            ("Button", "Target user clicks to view"),
+        ]
+    },
+}
+
+
+def _extract_cmds(pattern_str):
+    """Pull the slash command name(s) out of a NewMessage regex pattern.
+
+    Handles:  ^/ban(?:...)?$          -> ["/ban"]
+              ^/(welcome|goodbye)$    -> ["/welcome", "/goodbye"]
+              ^/set(welcome|goodbye)  -> ["/setwelcome", "/setgoodbye"]
+              ^/warn(?:s|list|limit)? -> ["/warn", "/warns", ...]
+    Returns [] for callback-data or non-slash patterns.
+    """
+    if not pattern_str or not pattern_str.startswith("^/"):
+        return []
+    body = pattern_str[2:]
+    m = re.match(r"^([a-zA-Z_]*)", body)
+    prefix = m.group(0)
+    rest = body[len(prefix):]
+
+    cmds = []
+    alts = re.match(r"^\((?:\?:)?((?:[^()]+))\)\??", rest)
+    if alts:
+        parts = [p.strip() for p in alts.group(1).split("|")]
+        wordish = [p for p in parts if p and re.fullmatch(r"[a-zA-Z_]+", p)]
+        if wordish and len(wordish) == len(parts):
+            # real alternation like (welcome|goodbye) or (?:s|list|limit)
+            if rest.startswith("(?:"):
+                cmds.append("/" + prefix)      # optional suffix: base counts
+            for p in wordish:
+                cmds.append("/" + prefix + p)
+        else:
+            cmds.append("/" + prefix)          # group holds args, not variants
+    else:
+        cmds.append("/" + prefix)
+
+    return [c for c in cmds if len(c) > 1]
+
+
+def _regex_of(builder, kind):
+    """Pull the raw regex string out of a Telethon event builder.
+
+    Telethon 1.37 stores NewMessage patterns as `compiled.match` (a bound
+    method) — the regex itself lives on `.__self__.pattern`. CallbackQuery
+    uses the same trick under `.match`, and compiles to bytes.
+    """
+    attr = "pattern" if kind == "NewMessage" else "match"
+    m = getattr(builder, attr, None)
+    regex = getattr(m, "__self__", None) if callable(m) else None
+    pat = getattr(regex, "pattern", None) if regex is not None else None
+    if isinstance(pat, bytes):
+        pat = pat.decode()
+    return pat
+
+
+_LITERAL_BTN = re.compile(r"^[A-Za-z0-9_|()\- ]+$")
+
+_ENTRY_ATTRS = ("init_bot_plugin", "init", "register")
+
+
+def _call_entry(fn):
+    """Call a plugin entry function with as many args as it accepts."""
+    import inspect
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return fn(bot_instance)
+    positional = [
+        p for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                      inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    has_varargs = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL for p in params
+    )
+    if has_varargs or len(positional) >= 3:
+        return fn(bot_instance, owner_user_id, owner_display_name)
+    if len(positional) == 2:
+        return fn(bot_instance, owner_user_id)
+    return fn(bot_instance)
+
+
+async def _ensure_all_loaded():
+    """Hot-load any bot plugin file that is not loaded yet.
+
+    Runs whenever the help menu is opened, so a .py file dropped into
+    bot_plugins/ shows up in the bot WITHOUT a restart. Plugins already
+    loaded by plugins/bot.py at startup are skipped via the shared dedupe
+    set. Helper modules without an entry function (e.g. _shared) are
+    ignored.
+    """
+    import importlib
+    import inspect
+
+    if bot_instance is None:
+        return
+    if not hasattr(bot_instance, "_loaded_bot_plugins"):
+        bot_instance._loaded_bot_plugins = set()
+    if not hasattr(bot_instance, "_seen_bot_plugins"):
+        bot_instance._seen_bot_plugins = set()
+    loaded = bot_instance._loaded_bot_plugins
+    seen = bot_instance._seen_bot_plugins
+
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        if path.stem == "__init__":
+            continue
+        mod_name = f"bot_plugins.{path.stem}"
+        if mod_name in seen or mod_name in loaded:
+            continue  # already attempted / already loaded at startup
+        seen.add(mod_name)
+        try:
+            module = importlib.import_module(mod_name)
+        except Exception as e:
+            print(f"❌ Hot-load failed for {mod_name}: {e}")
+            continue
+
+        entry = None
+        for attr in _ENTRY_ATTRS:
+            candidate = getattr(module, attr, None)
+            if callable(candidate):
+                entry = candidate
+                break
+        if entry is None:
+            continue  # helper module — nothing to register
+
+        try:
+            out = _call_entry(entry)
+            if inspect.isawaitable(out):
+                await out
+            loaded.add(mod_name)
+            print(f"✅ Hot-loaded bot plugin: {path.stem}")
+        except Exception as e:
+            print(f"❌ Hot-load failed for {mod_name}: {e}")
+
+
+def _discovered_categories():
+    """Group the bot's registered handlers by plugin module.
+
+    Slash commands (NewMessage) become the command list; literal callback
+    data (CallbackQuery buttons) become the button-action list, so even
+    plugins with no slash commands still show up in the menu.
+    """
+    found = {}
+    if bot_instance is None:
+        return found
+    try:
+        handlers = bot_instance.list_event_handlers()
+    except Exception:
+        return found
+
+    for callback, builder in handlers:
+        module = getattr(callback, "__module__", "") or ""
+        if not module.startswith("bot_plugins."):
+            continue
+        stem = module.split(".")[-1]
+        if stem in _SKIP_DISCOVERY:
+            continue
+
+        entry = found.setdefault(stem, {"commands": [], "buttons": []})
+
+        desc = ""
+        doc = getattr(callback, "__doc__", None)
+        if doc:
+            desc = doc.strip().splitlines()[0]
+
+        pat = _regex_of(builder, type(builder).__name__)
+        if not pat:
+            continue
+
+        if type(builder).__name__ == "NewMessage":
+            for cmd in _extract_cmds(pat):
+                if cmd not in [c for c, _ in entry["commands"]] and len(entry["commands"]) < 40:
+                    entry["commands"].append((cmd, desc))
+        else:
+            if (_LITERAL_BTN.match(pat) and len(pat) <= 32
+                    and pat not in entry["buttons"]):
+                entry["buttons"].append(pat)
+
+    categories = {}
+    for stem, entry in found.items():
+        icon, title = _DISCOVERED_META.get(stem, ("🧩", stem.replace("_", " ").title()))
+        categories[stem] = {
+            "icon": icon,
+            "title": title,
+            "commands": sorted(entry["commands"], key=lambda c: c[0]),
+            "buttons": sorted(entry["buttons"]),
+        }
+    return categories
+
+
+def get_help_categories():
+    """Core manual categories first, then every auto-discovered plugin."""
+    cats = dict(_CORE_CATEGORIES)
+    cats.update(_discovered_categories())
+    return cats
+
+
+def _help_buttons(extra):
+    """One button per category + the extra (Back / Main Menu) row."""
+    buttons = [
+        [Button.inline(f"{info['icon']} {info['title']}", b"cat_" + key.encode())]
+        for key, info in get_help_categories().items()
+    ]
+    buttons.append(extra)
+    return buttons
 
 def init_bot_plugin(bot, owner_id, owner_name):
     """Initialize the assistant bot plugin"""
@@ -181,16 +441,12 @@ def init_bot_plugin(bot, owner_id, owner_name):
         db = load_database()
         
         if menu == "help":
+            await _ensure_all_loaded()   # pick up any newly added plugins
             text = (
                 "📚 <b>Bot Commands Help</b>\n\n"
                 "👇 <i>Select a category below to view commands</i>"
             )
-            buttons = [
-                [Button.inline("🤖 Assistant", b"cat_assistant")],
-                [Button.inline("⚡ Alive / Ping", b"cat_alive")],
-                [Button.inline("🤫 Whisper", b"cat_whisper")],
-                [Button.inline("◀️ Back", b"menu_main")]
-            ]
+            buttons = _help_buttons([Button.inline("◀️ Back", b"menu_main")])
             await event.edit(text, buttons=buttons, parse_mode='html')
         
         elif menu == "assistant":
@@ -293,48 +549,29 @@ def init_bot_plugin(bot, owner_id, owner_name):
             return
         
         category = event.data_match.group(1).decode()
-        
-        categories = {
-            "assistant": {
-                "icon": "🤖",
-                "title": "Assistant Commands",
-                "commands": [
-                    ("/start", "Show main menu"),
-                    ("/help", "Show help menu"),
-                    ("/assistant", "Assistant status"),
-                    ("/assistant on", "Enable assistant mode"),
-                    ("/assistant off", "Disable assistant mode"),
-                    ("/assistant status", "Check assistant status"),
-                ]
-            },
-            "alive": {
-                "icon": "⚡",
-                "title": "Alive / Ping Commands",
-                "commands": [
-                    ("/alive", "Customize alive message"),
-                    ("/ping", "Customize ping message"),
-                    ("Buttons", "Change style, pic, quotes"),
-                ]
-            },
-            "whisper": {
-                "icon": "🤫",
-                "title": "Whisper Commands",
-                "commands": [
-                    (".w @username <text>", "Send secret whisper to user"),
-                    (".w <text> (reply)", "Send whisper by replying"),
-                    ("Button", "Target user clicks to view"),
-                ]
-            },
-        }
-        
+
+        await _ensure_all_loaded()   # pick up any newly added plugins
+        categories = get_help_categories()
+
         if category not in categories:
             await event.answer("❌ Category not found!", alert=True)
             return
-        
+
         info = categories[category]
         text = f"{info['icon']} <b>{info['title']}</b>\n\n"
-        for cmd, desc in info["commands"]:
-            text += f"❯ <code>{cmd}</code>\n   <i>{desc}</i>\n\n"
+        if info.get("commands"):
+            for cmd, desc in info["commands"]:
+                text += f"❯ <code>{cmd}</code>\n"
+                if desc:
+                    text += f"   <i>{desc}</i>\n"
+                text += "\n"
+        if info.get("buttons"):
+            text += "🔘 <i>Button actions:</i>\n"
+            for btn in info["buttons"]:
+                text += f"❯ <code>{btn}</code>\n"
+            text += "\n"
+        if not info.get("commands") and not info.get("buttons"):
+            text += "🤖 <i>Automatic feature — no manual commands.</i>\n\n"
         
         buttons = [
             [Button.inline("◀️ Back to Categories", b"menu_help")],
@@ -567,16 +804,12 @@ def init_bot_plugin(bot, owner_id, owner_name):
     @bot.on(events.NewMessage(pattern=r"^/help"))
     async def help_command_handler(event):
         if event.sender_id == owner_user_id:
+            await _ensure_all_loaded()   # pick up any newly added plugins
             text = (
                 "📚 <b>Bot Commands Help</b>\n\n"
                 "👇 <i>Select a category below to view commands</i>"
             )
-            buttons = [
-                [Button.inline("🤖 Assistant", b"cat_assistant")],
-                [Button.inline("⚡ Alive / Ping", b"cat_alive")],
-                [Button.inline("🤫 Whisper", b"cat_whisper")],
-                [Button.inline("🏠 Main Menu", b"menu_main")]
-            ]
+            buttons = _help_buttons([Button.inline("🏠 Main Menu", b"menu_main")])
             await event.reply(text, buttons=buttons, parse_mode='html')
         else:
             text = (
