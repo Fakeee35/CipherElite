@@ -1,7 +1,8 @@
 # =============================================================================
 #  CipherElite Userbot Plugin
 #
-#  Plugin Name:   style_picker   (commands: .styles / .stylepicker / .aistyle)
+#  Plugin Name:   style_picker
+#  Commands:      .styles / .stylepicker / .new_alive_style / .new_ping_style
 #  Author:        CipherElite Dev (@rishabhops)
 #  Repository:    https://github.com/rishabhops/CipherElite
 #  Support:       @thanosceo
@@ -13,6 +14,7 @@ import asyncio
 import html as html_lib
 import re
 import time
+import uuid
 from datetime import datetime
 
 import aiohttp
@@ -21,7 +23,7 @@ from telethon import events, Button, version
 from config.config import Config
 from utils.decorators import rishabh
 from utils.utils import CipherElite
-from plugins.bot import add_handler, CMD_LIST
+from plugins.bot import add_handler, CMD_LIST, bot
 from plugins.alive import (
     ALIVE_STYLES,
     PING_STYLES,
@@ -32,14 +34,18 @@ from plugins.alive import (
     user_config,
 )
 
-CATEGORY = "developer"
+CATEGORY = "utilities"
 
-# (chat_id, message_id) -> session dict
+# sessions for bot-side callbacks, keyed by (chat_id, message_id)
 SESSIONS = {}
+# AI results waiting to be posted, keyed by a short token
+AI_STORE = {}
+# who may use the menus (filled from SUDO_USERS + whoever runs the commands)
+OWNER_IDS = set(getattr(Config, "SUDO_USERS", []) or [])
 
-_CACHED_NAME = None
+_CACHED_OWNER_NAME = None
 
-_SPINNER = ["⠋", "", "", "⠸", "⠼", "", "⠦", "⠧", "⠇", ""]
+_SPINNER = ["⠋", "⠙", "", "", "⠼", "⠴", "", "", "⠇", "⠏"]
 
 # =============================================================================
 #  AI PROVIDERS  (same two APIs as plugins/aiplugingen.py)
@@ -181,6 +187,7 @@ def _sanitize_template(tpl):
 
 # =============================================================================
 #  LIVE GENERATION UI  (spinner while waiting + typewriter reveal)
+#  Runs on plain userbot text messages - no buttons needed here.
 # =============================================================================
 async def _safe_edit(message, text):
     try:
@@ -262,7 +269,7 @@ def _uptime_str():
 
 
 def _fill(tpl, name, speed):
-    """Fill a template with EVERY known value — str.format ignores unused
+    """Fill a template with EVERY known value - str.format ignores unused
     kwargs, so any placeholder the AI (or the user) puts in any style can
     never raise KeyError."""
     return tpl.format(
@@ -277,19 +284,20 @@ def _fill(tpl, name, speed):
     )
 
 
-async def _preview_text(event, kind, tpl=None, idx=0):
+async def _preview_text(client, kind, name, tpl=None, idx=0):
     """Render a style with live values. `tpl` overrides the indexed style."""
-    global _CACHED_NAME
     start = datetime.now()
-    me = await event.client.get_me()
+    try:
+        await client.get_me()
+    except Exception:
+        pass
     elapsed_ms = max(1, (datetime.now() - start).microseconds // 1000)
-    _CACHED_NAME = me.first_name or "Owner"
 
     if kind == "alive":
         template = tpl if tpl is not None else ALIVE_STYLES[idx % len(ALIVE_STYLES)]
     else:
         template = tpl if tpl is not None else PING_STYLES[idx % len(PING_STYLES)]
-    return _fill(template, _CACHED_NAME, elapsed_ms)
+    return _fill(template, name or "Owner", elapsed_ms)
 
 
 def _media_for(kind):
@@ -307,7 +315,8 @@ def _main_text():
         f"💫 Alive style: <code>#{user_config.alive_style_index + 1}</code>   "
         f"🏓 Ping style: <code>#{user_config.ping_style_index + 1}</code>\n\n"
         "<i>Which styles do you want to browse live?</i>\n"
-        "<i>Or create a brand-new one with AI:</i> <code>.aistyle &lt;prompt&gt;</code>"
+        "<i>Or create a brand-new one with AI:</i> "
+        "<code>.new_alive_style &lt;prompt&gt;</code>"
     )
 
 
@@ -355,12 +364,15 @@ def _ai_text(kind, prompt, preview, provider, model, just_set=False):
     return f"{head}\n\n{preview}\n\n<i>✅ set · 🔄 regenerate · Back</i>"
 
 
-def _ai_buttons():
+def _ai_buttons(token):
+    # the AI result token travels inside the callback data, so the bot can
+    # find the generated style no matter where/when the button is pressed
+    t = token.encode()
     return [
         [
-            Button.inline("✅ Set", b"sp_ai_set"),
-            Button.inline("🔄", b"sp_ai_new"),
-            Button.inline("⬅️ Back", b"sp_ai_back"),
+            Button.inline("✅ Set", b"sp_aiset_" + t),
+            Button.inline("🔄", b"sp_ainew_" + t),
+            Button.inline("⬅️ Back", b"sp_aiback_" + t),
         ]
     ]
 
@@ -382,6 +394,17 @@ def _forget(key):
     SESSIONS.pop(key, None)
 
 
+async def _open_inline(event, payload):
+    """Post an interactive menu through the helper bot (user accounts cannot
+    send inline buttons - the same trick plugins/alive.py uses)."""
+    results = await event.client.inline_query(Config.TG_BOT_USERNAME, payload)
+    return await results[0].click(
+        event.chat_id,
+        reply_to=event.reply_to_msg_id,
+        hide_via=True,
+    )
+
+
 # =============================================================================
 #  PLUGIN INTERFACE
 # =============================================================================
@@ -391,8 +414,8 @@ def init(client_instance):
         [
             ".styles - Live inline browser to preview & set .alive/.ping styles",
             ".stylepicker - Same as .styles",
-            ".aistyle <prompt> - AI designs a new alive style, live preview + set",
-            ".aistyle ping <prompt> - Same, for ping styles",
+            ".new_alive_style <prompt> - AI designs a new alive style, live preview + set",
+            ".new_ping_style <prompt> - Same, for ping styles",
         ],
         "Style Studio - browse alive/ping styles live with the arrow and set "
         "buttons, or generate a brand-new style from a prompt with AI "
@@ -403,172 +426,279 @@ def init(client_instance):
 async def register_commands():
 
     # -------------------------------------------------------------------------
-    # .styles / .stylepicker - open the picker
+    # .styles / .stylepicker - open the picker through the bot
     # -------------------------------------------------------------------------
     @CipherElite.on(events.NewMessage(pattern=r"\.(?:styles|stylepicker)$"))
     @rishabh()
     async def open_picker(event):
-        await event.reply(_main_text(), buttons=_main_buttons(), parse_mode="html")
-
-    # -------------------------------------------------------------------------
-    # .aistyle [ping] <prompt> - AI style generator with live UI
-    # -------------------------------------------------------------------------
-    @CipherElite.on(events.NewMessage(pattern=r"\.aistyle(?:\s+(.+))?$"))
-    @rishabh()
-    async def aistyle_handler(event):
-        args = (event.pattern_match.group(1) or "").strip()
-
-        kind = "alive"
-        if args.lower().startswith("ping "):
-            kind = "ping"
-            args = args[5:].strip()
-        if not args:
+        OWNER_IDS.add(event.sender_id)
+        if event.sender and event.sender.first_name:
+            global _CACHED_OWNER_NAME
+            _CACHED_OWNER_NAME = event.sender.first_name
+        try:
+            await _open_inline(event, "sp_menu")
+            await event.delete()
+        except Exception:
             await event.reply(
-                "🎨 <b>Usage:</b>\n"
-                "<code>.aistyle cyberpunk neon terminal</code>\n"
-                "<code>.aistyle ping minimal clean</code>",
+                _main_text() +
+                "\n\n⚠️ <i>The interactive menu needs the helper bot's inline "
+                "mode. Enable it via @BotFather if it is disabled.</i>",
                 parse_mode="html",
             )
-            return
+
+    # -------------------------------------------------------------------------
+    # .new_alive_style / .new_ping_style - AI generator with live typewriter
+    # -------------------------------------------------------------------------
+    async def _aistyle_flow(event, kind, prompt):
+        OWNER_IDS.add(event.sender_id)
+        if event.sender and event.sender.first_name:
+            global _CACHED_OWNER_NAME
+            _CACHED_OWNER_NAME = event.sender.first_name
 
         status = await event.reply(
-            f"🎨 <b>AI is designing your style…</b>\n<i>{html_lib.escape(args[:80])}</i>",
+            f"🎨 <b>AI is designing your style…</b>\n<i>{html_lib.escape(prompt[:80])}</i>",
             parse_mode="html",
         )
 
-        template, provider, model = await _live_generate(status, kind, args)
+        template, provider, model = await _live_generate(status, kind, prompt)
         if template is None:
             return
 
-        preview = await _preview_text(event, kind, tpl=template)
+        token = uuid.uuid4().hex[:10]
+        AI_STORE[token] = {
+            "kind": kind,
+            "template": template,
+            "prompt": prompt,
+            "provider": provider,
+            "model": model,
+        }
+        if len(AI_STORE) > 100:
+            AI_STORE.clear()
+
         try:
+            await _open_inline(event, f"sp_ai_{token}")
             await status.delete()
         except Exception:
-            pass
-        sent = await event.respond(
-            _ai_text(kind, args, preview, provider, model),
-            buttons=_ai_buttons(),
-            parse_mode="html",
-        )
-        _remember(
-            (event.chat_id, sent.id),
-            {"mode": "ai", "kind": kind, "template": template, "prompt": args},
-        )
-
-    # -------------------------------------------------------------------------
-    # Callback router: sp_<action>
-    # -------------------------------------------------------------------------
-    @CipherElite.on(events.CallbackQuery(pattern=b"sp_(.*)"))
-    @rishabh()
-    async def picker_callback(event):
-        action = event.data_match.group(1).decode()
-        key = _session_key(event)
-
-        # -- mode selection from the main menu -------------------------------
-        if action in ("alive", "ping"):
-            idx = (
-                user_config.alive_style_index if action == "alive"
-                else user_config.ping_style_index
+            # inline mode unavailable -> plain text preview without buttons
+            preview = await _preview_text(
+                event.client, kind, _CACHED_OWNER_NAME, tpl=template
             )
-            try:
-                await event.delete()
-            except Exception:
-                pass
-            preview = await _preview_text(event, action, idx=idx)
-            sent = await event.respond(
-                _browser_text(action, idx, preview),
-                file=_media_for(action),
-                buttons=_browser_buttons(),
+            await _safe_edit(status, _ai_text(kind, prompt, preview, provider, model))
+
+    @CipherElite.on(events.NewMessage(pattern=r"\.new_alive_style(?:\s+(.+))?$"))
+    @rishabh()
+    async def new_alive_style(event):
+        prompt = (event.pattern_match.group(1) or "").strip()
+        if not prompt:
+            await event.reply(
+                "🎨 <b>Usage:</b> <code>.new_alive_style cyberpunk neon terminal</code>",
                 parse_mode="html",
             )
-            _remember((event.chat_id, sent.id),
-                      {"mode": "browse", "kind": action, "idx": idx})
             return
+        await _aistyle_flow(event, "alive", prompt)
 
-        sess = SESSIONS.get(key)
-        if sess is None:
-            await event.answer("Session expired - send .styles again", alert=True)
+    @CipherElite.on(events.NewMessage(pattern=r"\.new_ping_style(?:\s+(.+))?$"))
+    @rishabh()
+    async def new_ping_style(event):
+        prompt = (event.pattern_match.group(1) or "").strip()
+        if not prompt:
+            await event.reply(
+                "🎨 <b>Usage:</b> <code>.new_ping_style minimal clean gold</code>",
+                parse_mode="html",
+            )
             return
+        await _aistyle_flow(event, "ping", prompt)
 
-        # -- AI preview actions ----------------------------------------------
-        if sess.get("mode") == "ai":
-            kind = sess["kind"]
-            if action == "ai_set":
-                if kind == "alive":
-                    user_config.custom_alive_text = sess["template"]
-                else:
-                    user_config.custom_ping_text = sess["template"]
-                save_config()
-                preview = await _preview_text(event, kind, tpl=sess["template"])
-                await event.edit(
-                    _ai_text(kind, sess["prompt"], preview, "saved", "saved", just_set=True),
-                    buttons=_ai_buttons(),
+    # =========================================================================
+    #  BOT SIDE - menus, previews and callbacks (bots CAN send buttons)
+    # =========================================================================
+    if bot:
+
+        @bot.on(events.InlineQuery(pattern=r"^sp_menu$"))
+        async def iq_menu(event):
+            if event.sender_id not in OWNER_IDS:
+                return await event.answer(
+                    [event.builder.article(" Owner only", text=" Owner only.")],
+                )
+            await event.answer([
+                event.builder.article(
+                    "🎨 Style Studio",
+                    text=_main_text(),
+                    buttons=_main_buttons(),
                     parse_mode="html",
                 )
-                await event.answer(f"✅ AI {kind} style set!", alert=False)
-            elif action == "ai_new":
-                # regenerate in place with the same live UI
-                template, provider, model = await _live_generate(
-                    event, kind, sess["prompt"]
+            ])
+
+        @bot.on(events.InlineQuery(pattern=r"^sp_browser_(alive|ping)$"))
+        async def iq_browser(event):
+            if event.sender_id not in OWNER_IDS:
+                return await event.answer(
+                    [event.builder.article("⛔ Owner only", text="⛔ Owner only.")],
                 )
-                if template is None:
-                    await event.answer("❌ AI failed - try again", alert=True)
-                    return
-                sess["template"] = template
-                preview = await _preview_text(event, kind, tpl=template)
-                await event.edit(
-                    _ai_text(kind, sess["prompt"], preview, provider, model),
-                    buttons=_ai_buttons(),
+            kind = event.pattern_match.group(1).decode()
+            idx = (
+                user_config.alive_style_index if kind == "alive"
+                else user_config.ping_style_index
+            )
+            preview = await _preview_text(bot, kind, _CACHED_OWNER_NAME, idx=idx)
+            text = _browser_text(kind, idx, preview)
+            media = _media_for(kind)
+            if media:
+                result = event.builder.photo(
+                    media, text=text, buttons=_browser_buttons(), parse_mode="html"
+                )
+            else:
+                result = event.builder.article(
+                    "Style browser", text=text,
+                    buttons=_browser_buttons(), parse_mode="html",
+                )
+            await event.answer([result])
+
+        @bot.on(events.InlineQuery(pattern=r"^sp_ai_([a-f0-9]+)$"))
+        async def iq_ai(event):
+            if event.sender_id not in OWNER_IDS:
+                return await event.answer(
+                    [event.builder.article("⛔ Owner only", text="⛔ Owner only.")],
+                )
+            data = AI_STORE.get(event.pattern_match.group(1).decode())
+            if not data:
+                return await event.answer(
+                    [event.builder.article(
+                        "⏳ Expired",
+                        text="⏳ <i>That AI style expired - run the command again.</i>",
+                        parse_mode="html",
+                    )],
+                )
+            token = event.pattern_match.group(1).decode()
+            preview = await _preview_text(
+                bot, data["kind"], _CACHED_OWNER_NAME, tpl=data["template"]
+            )
+            await event.answer([
+                event.builder.article(
+                    "🎨 AI Style",
+                    text=_ai_text(
+                        data["kind"], data["prompt"], preview,
+                        data["provider"], data["model"],
+                    ),
+                    buttons=_ai_buttons(token),
                     parse_mode="html",
                 )
-            elif action == "ai_back":
-                _forget(key)
+            ])
+
+        @bot.on(events.CallbackQuery(pattern=b"sp_(.*)"))
+        async def picker_callback(event):
+            if event.sender_id not in OWNER_IDS:
+                return await event.answer("⛔ This is only for the bot owner!", alert=True)
+
+            action = event.data_match.group(1).decode()
+            key = _session_key(event)
+
+            # -- mode selection from the main menu -------------------------
+            if action in ("alive", "ping"):
+                idx = (
+                    user_config.alive_style_index if action == "alive"
+                    else user_config.ping_style_index
+                )
+                preview = await _preview_text(bot, action, _CACHED_OWNER_NAME, idx=idx)
+                _remember(key, {"mode": "browse", "kind": action, "idx": idx})
+                return await event.edit(
+                    _browser_text(action, idx, preview),
+                    buttons=_browser_buttons(),
+                    parse_mode="html",
+                )
+
+            # -- AI preview actions (token travels inside the callback data) -
+            ai_match = re.match(r"ai(set|new|back)_([a-f0-9]+)", action)
+            if ai_match:
+                verb, token = ai_match.group(1), ai_match.group(2)
+                data = AI_STORE.get(token)
+                if data is None:
+                    return await event.answer(
+                        "That AI style expired - run the command again", alert=True
+                    )
+                kind = data["kind"]
+
+                if verb == "set":
+                    if kind == "alive":
+                        user_config.custom_alive_text = data["template"]
+                    else:
+                        user_config.custom_ping_text = data["template"]
+                    save_config()
+                    preview = await _preview_text(
+                        bot, kind, _CACHED_OWNER_NAME, tpl=data["template"]
+                    )
+                    await event.edit(
+                        _ai_text(kind, data["prompt"], preview, "saved", "saved", just_set=True),
+                        buttons=_ai_buttons(token),
+                        parse_mode="html",
+                    )
+                    return await event.answer(f"✅ AI {kind} style set!", alert=False)
+
+                if verb == "new":
+                    await event.answer("🔄 Regenerating…")
+                    system = AI_SYSTEM_ALIVE if kind == "alive" else AI_SYSTEM_PING
+                    raw, provider, model = await _ai_generate(system, data["prompt"])
+                    if raw is None:
+                        return await event.answer("❌ AI failed - try again", alert=True)
+                    data["template"] = _sanitize_template(_extract_template(raw))
+                    data["provider"], data["model"] = provider, model
+                    preview = await _preview_text(
+                        bot, kind, _CACHED_OWNER_NAME, tpl=data["template"]
+                    )
+                    return await event.edit(
+                        _ai_text(kind, data["prompt"], preview, provider, model),
+                        buttons=_ai_buttons(token),
+                        parse_mode="html",
+                    )
+
+                # back
+                AI_STORE.pop(token, None)
                 try:
                     await event.delete()
                 except Exception:
                     pass
-            return
+                return
 
-        # -- built-in style browser actions -----------------------------------
-        kind, idx = sess["kind"], sess["idx"]
-        styles = ALIVE_STYLES if kind == "alive" else PING_STYLES
+            # -- built-in style browser actions -----------------------------
+            sess = SESSIONS.get(key)
+            if sess is None:
+                return await event.answer("Session expired - send .styles again", alert=True)
 
-        if action == "prev":
-            idx = (idx - 1) % len(styles)
-        elif action == "next":
-            idx = (idx + 1) % len(styles)
-        elif action == "set":
-            if kind == "alive":
-                user_config.alive_style_index = idx
-                user_config.custom_alive_text = None   # built-in style wins again
+            kind, idx = sess["kind"], sess["idx"]
+            styles = ALIVE_STYLES if kind == "alive" else PING_STYLES
+
+            if action == "prev":
+                idx = (idx - 1) % len(styles)
+            elif action == "next":
+                idx = (idx + 1) % len(styles)
+            elif action == "set":
+                if kind == "alive":
+                    user_config.alive_style_index = idx
+                    user_config.custom_alive_text = None   # built-in style wins again
+                else:
+                    user_config.ping_style_index = idx
+                    user_config.custom_ping_text = None
+                save_config()
+                preview = await _preview_text(bot, kind, _CACHED_OWNER_NAME, idx=idx)
+                await event.edit(
+                    _browser_text(kind, idx, preview, just_set=True),
+                    buttons=_browser_buttons(),
+                    parse_mode="html",
+                )
+                return await event.answer(f"✅ {kind.title()} style #{idx + 1} set!", alert=False)
+            elif action == "back":
+                _forget(key)
+                return await event.edit(
+                    _main_text(), buttons=_main_buttons(), parse_mode="html"
+                )
             else:
-                user_config.ping_style_index = idx
-                user_config.custom_ping_text = None
-            save_config()
-            preview = await _preview_text(event, kind, idx=idx)
+                return
+
+            # prev/next -> live re-render in place
+            sess["idx"] = idx
+            preview = await _preview_text(bot, kind, _CACHED_OWNER_NAME, idx=idx)
             await event.edit(
-                _browser_text(kind, idx, preview, just_set=True),
+                _browser_text(kind, idx, preview),
                 buttons=_browser_buttons(),
                 parse_mode="html",
             )
-            await event.answer(f"✅ {kind.title()} style #{idx + 1} set!", alert=False)
-            return
-        elif action == "back":
-            _forget(key)
-            try:
-                await event.delete()
-            except Exception:
-                pass
-            await event.respond(_main_text(), buttons=_main_buttons(), parse_mode="html")
-            return
-        else:
-            return
-
-        # prev/next -> live re-render in place (media stays attached)
-        sess["idx"] = idx
-        preview = await _preview_text(event, kind, idx=idx)
-        await event.edit(
-            _browser_text(kind, idx, preview),
-            buttons=_browser_buttons(),
-            parse_mode="html",
-        )
