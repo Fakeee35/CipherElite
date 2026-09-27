@@ -34,7 +34,7 @@ from plugins.alive import (
     user_config,
 )
 
-CATEGORY = "utilities"
+CATEGORY = "developer"
 
 # sessions for bot-side callbacks, keyed by (chat_id, message_id)
 SESSIONS = {}
