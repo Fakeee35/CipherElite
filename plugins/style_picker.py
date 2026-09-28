@@ -34,7 +34,7 @@ from plugins.alive import (
     user_config,
 )
 
-CATEGORY = "developer"
+CATEGORY = "utilities"
 
 # sessions for bot-side callbacks, keyed by (chat_id, message_id)
 SESSIONS = {}
@@ -394,15 +394,32 @@ def _forget(key):
     SESSIONS.pop(key, None)
 
 
-async def _open_inline(event, payload):
+async def _open_inline(event, payload, fb_text=None, fb_buttons=None):
     """Post an interactive menu through the helper bot (user accounts cannot
-    send inline buttons - the same trick plugins/alive.py uses)."""
-    results = await event.client.inline_query(Config.TG_BOT_USERNAME, payload)
-    return await results[0].click(
-        event.chat_id,
-        reply_to=event.reply_to_msg_id,
-        hide_via=True,
-    )
+    send inline buttons).
+
+    Layer 1: inline query + click - the same trick plugins/alive.py uses.
+    Layer 2: if the inline round-trip fails for any reason (bot not started,
+             inline mode off, network hiccup), the bot sends the message
+             itself - a message sent by a BOT always keeps its buttons.
+    """
+    try:
+        results = await event.client.inline_query(Config.TG_BOT_USERNAME, payload)
+        return await results[0].click(
+            event.chat_id,
+            reply_to=event.reply_to_msg_id,
+            hide_via=True,
+        )
+    except Exception:
+        if bot is not None and fb_text is not None:
+            return await bot.send_message(
+                event.chat_id,
+                fb_text,
+                buttons=fb_buttons,
+                parse_mode="html",
+                reply_to=event.reply_to_msg_id,
+            )
+        raise
 
 
 # =============================================================================
@@ -425,6 +442,27 @@ def init(client_instance):
 
 async def register_commands():
 
+    def _iq_safe(fn):
+        """Never let a bot-side inline handler die silently: on any error the
+        user sees the error text inside the inline result instead of getting
+        an empty/no-result query (which would look like 'buttons missing')."""
+        async def wrap(event):
+            try:
+                return await fn(event)
+            except Exception as e:
+                try:
+                    await event.answer(
+                        [event.builder.article(
+                            "⚠️ Error",
+                            text=f"⚠️ <code>{type(e).__name__}: {e}</code>",
+                            parse_mode="html",
+                        )],
+                        cache_time=1,
+                    )
+                except Exception:
+                    pass
+        return wrap
+
     # -------------------------------------------------------------------------
     # .styles / .stylepicker - open the picker through the bot
     # -------------------------------------------------------------------------
@@ -436,7 +474,7 @@ async def register_commands():
             global _CACHED_OWNER_NAME
             _CACHED_OWNER_NAME = event.sender.first_name
         try:
-            await _open_inline(event, "sp_menu")
+            await _open_inline(event, "sp_menu", _main_text(), _main_buttons())
             await event.delete()
         except Exception:
             await event.reply(
@@ -475,15 +513,21 @@ async def register_commands():
         if len(AI_STORE) > 100:
             AI_STORE.clear()
 
+        preview = await _preview_text(
+            event.client, kind, _CACHED_OWNER_NAME, tpl=template
+        )
+        ai_text = _ai_text(kind, prompt, preview, provider, model)
         try:
-            await _open_inline(event, f"sp_ai_{token}")
+            await _open_inline(event, f"sp_ai_{token}", ai_text, _ai_buttons(token))
             await status.delete()
         except Exception:
-            # inline mode unavailable -> plain text preview without buttons
-            preview = await _preview_text(
-                event.client, kind, _CACHED_OWNER_NAME, tpl=template
+            # both delivery layers failed -> plain text preview + hint
+            await _safe_edit(
+                status,
+                ai_text
+                + "\n\n⚠️ <i>Buttons need the helper bot - check TG_BOT_USERNAME "
+                "in vars.py and make sure you have started your bot once.</i>",
             )
-            await _safe_edit(status, _ai_text(kind, prompt, preview, provider, model))
 
     @CipherElite.on(events.NewMessage(pattern=r"\.new_alive_style(?:\s+(.+))?$"))
     @rishabh()
@@ -515,10 +559,11 @@ async def register_commands():
     if bot:
 
         @bot.on(events.InlineQuery(pattern=r"^sp_menu$"))
+        @_iq_safe
         async def iq_menu(event):
             if event.sender_id not in OWNER_IDS:
                 return await event.answer(
-                    [event.builder.article(" Owner only", text=" Owner only.")],
+                    [event.builder.article(" Owner only", text=" Owner only.")], cache_time=1,
                 )
             await event.answer([
                 event.builder.article(
@@ -527,13 +572,14 @@ async def register_commands():
                     buttons=_main_buttons(),
                     parse_mode="html",
                 )
-            ])
+            ], cache_time=1)
 
         @bot.on(events.InlineQuery(pattern=r"^sp_browser_(alive|ping)$"))
+        @_iq_safe
         async def iq_browser(event):
             if event.sender_id not in OWNER_IDS:
                 return await event.answer(
-                    [event.builder.article("⛔ Owner only", text="⛔ Owner only.")],
+                    [event.builder.article("⛔ Owner only", text="⛔ Owner only.")], cache_time=1,
                 )
             kind = event.pattern_match.group(1).decode()
             idx = (
@@ -552,13 +598,14 @@ async def register_commands():
                     "Style browser", text=text,
                     buttons=_browser_buttons(), parse_mode="html",
                 )
-            await event.answer([result])
+            await event.answer([result], cache_time=1)
 
         @bot.on(events.InlineQuery(pattern=r"^sp_ai_([a-f0-9]+)$"))
+        @_iq_safe
         async def iq_ai(event):
             if event.sender_id not in OWNER_IDS:
                 return await event.answer(
-                    [event.builder.article("⛔ Owner only", text="⛔ Owner only.")],
+                    [event.builder.article("⛔ Owner only", text="⛔ Owner only.")], cache_time=1,
                 )
             data = AI_STORE.get(event.pattern_match.group(1).decode())
             if not data:
@@ -567,7 +614,7 @@ async def register_commands():
                         "⏳ Expired",
                         text="⏳ <i>That AI style expired - run the command again.</i>",
                         parse_mode="html",
-                    )],
+                    )], cache_time=1,
                 )
             token = event.pattern_match.group(1).decode()
             preview = await _preview_text(
@@ -583,7 +630,7 @@ async def register_commands():
                     buttons=_ai_buttons(token),
                     parse_mode="html",
                 )
-            ])
+            ], cache_time=1)
 
         @bot.on(events.CallbackQuery(pattern=b"sp_(.*)"))
         async def picker_callback(event):
